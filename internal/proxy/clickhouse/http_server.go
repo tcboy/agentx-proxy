@@ -318,24 +318,35 @@ func (s *HTTPServer) existsTable(query string) string {
 }
 
 func pgTypeFromMySQL(mysqlType string) string {
+	lower := strings.ToLower(mysqlType)
 	switch {
-	case strings.Contains(mysqlType, "int"):
-		return "Int64"
-	case strings.Contains(mysqlType, "decimal"):
-		return "Decimal64(12)"
-	case strings.Contains(mysqlType, "float"), strings.Contains(mysqlType, "double"):
-		return "Float64"
-	case strings.Contains(mysqlType, "datetime"):
-		return "DateTime64(3)"
-	case strings.Contains(mysqlType, "date"):
-		return "Date"
-	case strings.Contains(mysqlType, "json"):
-		return "Map(LowCardinality(String), String)"
-	case strings.Contains(mysqlType, "varchar"), strings.Contains(mysqlType, "char"),
-		strings.Contains(mysqlType, "text"):
-		return "String"
-	case strings.Contains(mysqlType, "tinyint(1)"):
+	case strings.HasPrefix(lower, "tinyint(1)"):
 		return "UInt8"
+	case strings.HasPrefix(lower, "smallint"):
+		return "Int16"
+	case strings.HasPrefix(lower, "mediumint"):
+		return "Int24"
+	case strings.HasPrefix(lower, "bigint"):
+		return "Int64"
+	case strings.HasPrefix(lower, "int"), strings.HasPrefix(lower, "integer"):
+		return "Int32"
+	case strings.HasPrefix(lower, "decimal"):
+		return "Decimal64(12)"
+	case strings.HasPrefix(lower, "float"):
+		return "Float32"
+	case strings.HasPrefix(lower, "double"):
+		return "Float64"
+	case strings.HasPrefix(lower, "datetime"):
+		return "DateTime64(3)"
+	case strings.HasPrefix(lower, "date"):
+		return "Date"
+	case strings.HasPrefix(lower, "json"):
+		return "Map(LowCardinality(String), String)"
+	case strings.HasPrefix(lower, "longtext"), strings.HasPrefix(lower, "mediumtext"),
+		strings.HasPrefix(lower, "text"):
+		return "String"
+	case strings.HasPrefix(lower, "varchar"), strings.HasPrefix(lower, "char"):
+		return "String"
 	default:
 		return "String"
 	}

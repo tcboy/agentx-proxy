@@ -36,17 +36,6 @@ func NewWriteBuffer(maxSize int, flushInterval time.Duration, pool *mysql.Pool) 
 	return wb
 }
 
-func (wb *WriteBuffer) Enquery(sql string) {
-	wb.mu.Lock()
-	defer wb.mu.Unlock()
-
-	wb.buffer = append(wb.buffer, sql)
-
-	if len(wb.buffer) >= wb.maxSize {
-		wb.flushLocked()
-	}
-}
-
 func (wb *WriteBuffer) Enqueue(sql string) {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()

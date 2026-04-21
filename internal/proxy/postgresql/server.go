@@ -2,14 +2,12 @@ package postgresql
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/agentx-labs/agentx-proxy/internal/config"
 	"github.com/agentx-labs/agentx-proxy/internal/mysql"
@@ -126,8 +124,8 @@ func (s *Server) handleConn(conn net.Conn, connID int) {
 		parameters:         make(map[string]string),
 		w:                  pgwire.NewWriter(conn),
 		r:                  pgwire.NewReader(conn),
-		pid:                uint32(rand.Intn(100000)),
-		secret:             uint32(rand.Intn(100000)),
+		pid:                uint32(rand.IntN(100000)),
+		secret:             uint32(rand.IntN(100000)),
 	}
 
 	slog.Info("new PG connection", "conn_id", connID, "remote", conn.RemoteAddr())
@@ -236,7 +234,7 @@ func (s *Server) handleMessage(state *connState, msgType byte, body []byte, conn
 
 func (s *Server) handleSimpleQuery(state *connState, body []byte, connID int) error {
 	query := pgwire.ParseQuery(body).String
-	query = query[:len(query)-1] // Remove null terminator if present
+	query = strings.TrimRight(query, "\x00")
 
 	slog.Debug("query", "conn_id", connID, "sql", query)
 
@@ -420,8 +418,13 @@ func (s *Server) executeQuery(state *connState, query string, connID int) error 
 	}
 
 	// Check for SELECT version()
-	if normalizeQuery(query) == "select version()" || len(query) >= 15 && query[:15] == "SELECT version()" {
-		return state.w.SendCommandComplete("SELECT")
+	if normalizeQuery(query) == "select version()" || (len(query) >= 15 && strings.EqualFold(query[:14], "select version")) {
+		fields := []pgwire.FieldDescription{
+			{Name: "version", TypeOID: 25, TypeSize: -1, FormatCode: 0},
+		}
+		state.w.SendRowDescription(fields)
+		state.w.SendDataRow([]interface{}{"14.0 (AgentX Proxy)"}, nil)
+		return state.w.SendCommandComplete("SELECT 1")
 	}
 
 	// Translate PG SQL to MySQL SQL
@@ -514,19 +517,19 @@ func (s *Server) executeCatalogQuery(state *connState, query string, connID int)
 func (s *Server) executeMySQLQuery(state *connState, query string, connID int) error {
 	ctx := context.Background()
 
+	// Detect write queries upfront to avoid failed Query attempt
+	if isWriteQuery(query) {
+		result, err := s.pool.Exec(ctx, query)
+		if err != nil {
+			return fmt.Errorf("exec: %w (query: %s)", err, query)
+		}
+		affected, _ := result.RowsAffected()
+		tag := getCommandTag(query, affected, 0)
+		return state.w.SendCommandComplete(tag)
+	}
+
 	rows, err := s.pool.Query(ctx, query)
 	if err != nil {
-		// Check if it's a write query
-		if err == sql.ErrNoRows || isWriteQuery(query) {
-			result, writeErr := s.pool.Exec(ctx, query)
-			if writeErr != nil {
-				return fmt.Errorf("exec: %w (query: %s)", writeErr, query)
-			}
-
-			affected, _ := result.RowsAffected()
-			tag := getCommandTag(query, affected, 0)
-			return state.w.SendCommandComplete(tag)
-		}
 		return fmt.Errorf("query: %w (query: %s)", err, query)
 	}
 	defer rows.Close()
@@ -684,7 +687,9 @@ func (s *Server) handleShowCommand(state *connState, query string) error {
 // Helpers
 
 func normalizeQuery(q string) string {
-	q = q[:len(q)-1] // Remove null terminator if present
+	if len(q) > 0 && q[len(q)-1] == 0 {
+		q = q[:len(q)-1]
+	}
 	return strings.ToLower(strings.TrimSpace(q))
 }
 
@@ -762,6 +767,3 @@ func mysqlTypeToPGOID(mysqlType string) uint32 {
 	}
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}

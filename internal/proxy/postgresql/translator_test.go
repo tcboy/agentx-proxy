@@ -1,6 +1,7 @@
 package postgresql
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -280,4 +281,241 @@ func containsStrAt(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestTranslateDollarParams(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"SELECT * FROM users WHERE id = $1", "SELECT * FROM users WHERE id = ?"},
+		{"SELECT * FROM users WHERE id = $1 AND name = $2", "SELECT * FROM users WHERE id = ? AND name = ?"},
+		{"SELECT $1, $2, $3", "SELECT ?, ?, ?"},
+	}
+
+	for _, tc := range tests {
+		result, err := tr.Translate(tc.input)
+		if err != nil {
+			t.Fatalf("Translate(%q) error: %v", tc.input, err)
+		}
+		if !containsStr(result, "?") {
+			t.Errorf("Translate(%q) should contain ?, got %q", tc.input, result)
+		}
+		if containsStr(result, "$") {
+			t.Errorf("Translate(%q) should not contain $, got %q", tc.input, result)
+		}
+	}
+}
+
+func TestTranslateStringAgg(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := "SELECT string_agg(name, ',') FROM users"
+	result := tr.translateStringAgg(input)
+
+	if !containsStr(result, "GROUP_CONCAT") {
+		t.Errorf("translateStringAgg should contain GROUP_CONCAT, got %q", result)
+	}
+}
+
+func TestTranslateBoolOperators(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	tests := []struct {
+		input    string
+		contains string
+	}{
+		{
+			input:    "SELECT * FROM users WHERE active IS true",
+			contains: "1",
+		},
+		{
+			input:    "SELECT * FROM users WHERE deleted IS false",
+			contains: "0",
+		},
+	}
+
+	for _, tc := range tests {
+		result := tr.translateBoolOperators(tc.input)
+		if !containsStr(result, tc.contains) {
+			t.Errorf("translateBoolOperators(%q) should contain %q, got %q", tc.input, tc.contains, result)
+		}
+	}
+}
+
+func TestTranslateFullPipeline(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	// A typical complex Langfuse PG query
+	input := `SELECT id, name, created_at FROM traces WHERE project_id = $1 AND name ILIKE '%test%' ORDER BY created_at DESC LIMIT 10`
+	result, err := tr.Translate(input)
+	if err != nil {
+		t.Fatalf("Translate error: %v", err)
+	}
+
+	// Check key translations
+	if containsStr(result, "ILIKE") {
+		t.Error("ILIKE should be translated")
+	}
+	if containsStr(result, "$") {
+		t.Error("$ params should be translated to ?")
+	}
+	if !containsStr(result, "LIKE") {
+		t.Error("Should contain LIKE")
+	}
+}
+
+func TestTranslateEdgeCases(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	tests := []struct {
+		name  string
+		input string
+		check func(string) bool
+	}{
+		{
+			name:  "empty query",
+			input: "",
+			check: func(s string) bool { return s == "" },
+		},
+		{
+			name:  "query without special chars",
+			input: "SELECT 1",
+			check: func(s string) bool { return s == "SELECT 1" },
+		},
+		{
+			name:  "query with dollar sign in string",
+			input: "SELECT '$1' as literal",
+			check: func(s string) bool { return containsStr(s, "?") },
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := tr.Translate(tc.input)
+			if err != nil {
+				t.Fatalf("Translate error: %v", err)
+			}
+			if !tc.check(result) {
+				t.Errorf("Translate(%q) = %q failed check", tc.input, result)
+			}
+		})
+	}
+}
+
+func TestTranslateOnConflictWithMultipleColumns(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := `INSERT INTO table1 (a, b, c) VALUES (1, 2, 3) ON CONFLICT (a, b) DO UPDATE SET c = EXCLUDED.c, a = EXCLUDED.a`
+	result := tr.translateOnConflict(input)
+
+	if !containsStr(result, "ON DUPLICATE KEY UPDATE") {
+		t.Errorf("should contain ON DUPLICATE KEY UPDATE, got %q", result)
+	}
+	if containsStr(result, "EXCLUDED") {
+		t.Error("should not contain EXCLUDED")
+	}
+	if !containsStr(result, "VALUES(") {
+		t.Error("should contain VALUES()")
+	}
+}
+
+func TestTranslateDateTruncAllUnits(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	tests := []struct {
+		unit     string
+		expected string
+	}{
+		{"second", "DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s')"},
+		{"minute", "DATE_FORMAT(ts, '%Y-%m-%d %H:%i:00')"},
+		{"hour", "DATE_FORMAT(ts, '%Y-%m-%d %H:00:00')"},
+		{"day", "DATE(ts)"},
+		{"week", "DATE_SUB(ts, INTERVAL WEEKDAY(ts) DAY)"},
+		{"month", "DATE_FORMAT(ts, '%Y-%m-01')"},
+		{"quarter", "MAKEDATE(YEAR(ts), 1) + INTERVAL"},
+		{"year", "MAKEDATE(YEAR(ts), 1)"},
+	}
+
+	for _, tc := range tests {
+		input := fmt.Sprintf("SELECT date_trunc('%s', ts)", tc.unit)
+		result := tr.translateDateTrunc(input)
+		if !containsStr(result, tc.expected) {
+			t.Errorf("date_trunc('%s') should contain %q, got %q", tc.unit, tc.expected, result)
+		}
+	}
+}
+
+func TestTranslateJSONBOperatorsNested(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := "SELECT data->'key'->'nested' FROM users"
+	result := tr.translateJSONBFunctions(input)
+
+	if !containsStr(result, "JSON_EXTRACT") {
+		t.Errorf("should contain JSON_EXTRACT, got %q", result)
+	}
+}
+
+func TestTranslateIntervalArith(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := "SELECT * FROM logs WHERE created_at > NOW() - INTERVAL '7' DAY"
+	result := tr.translateIntervalArith(input)
+
+	if !containsStr(result, "INTERVAL 7 DAY") {
+		t.Errorf("should contain INTERVAL 7 DAY, got %q", result)
+	}
+}
+
+func TestTranslateGenerateSeries(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := "SELECT * FROM GENERATE_SERIES(1, 10)"
+	result := tr.translateGenerateSeries(input)
+
+	if !containsStr(result, "WITH RECURSIVE") {
+		t.Errorf("should contain WITH RECURSIVE, got %q", result)
+	}
+}
+
+func TestTranslateLimit1ByWithWrap(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := "SELECT id, name FROM traces ORDER BY timestamp DESC LIMIT 1 BY id, project_id"
+	result := tr.translateLimit1By(input)
+
+	if !containsStr(result, "ROW_NUMBER()") {
+		t.Errorf("should use ROW_NUMBER(), got %q", result)
+	}
+	if !containsStr(result, "PARTITION BY") {
+		t.Errorf("should contain PARTITION BY, got %q", result)
+	}
+}
+
+func TestTranslateToTsVectorMatchAgainst(t *testing.T) {
+	tr := NewTranslator("json", "match_against")
+
+	input := "SELECT * FROM comments WHERE to_tsvector('english', content) @@ plainto_tsquery('english', 'search term')"
+	result := tr.translateToTsVector(input)
+
+	if !containsStr(result, "MATCH(") {
+		t.Errorf("should contain MATCH(), got %q", result)
+	}
+	if !containsStr(result, "AGAINST(") {
+		t.Errorf("should contain AGAINST(), got %q", result)
+	}
+}
+
+func TestTranslateToTsVectorLikeMode(t *testing.T) {
+	tr := NewTranslator("json", "like")
+
+	input := "SELECT * FROM comments WHERE to_tsvector('english', content) @@ plainto_tsquery('english', 'search')"
+	result := tr.translateToTsVector(input)
+
+	if !containsStr(result, "LIKE") {
+		t.Errorf("in like mode, should contain LIKE, got %q", result)
+	}
 }

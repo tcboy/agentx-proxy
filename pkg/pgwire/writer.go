@@ -3,6 +3,7 @@ package pgwire
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"strconv"
 )
@@ -121,7 +122,7 @@ func (w *Writer) SendDataRow(values []interface{}, formatCodes []int16) error {
 				data = []byte("f")
 			}
 		default:
-			data = []byte(strconv.FormatUint(uint64(val.(uint32)), 10))
+			data = []byte(fmt.Sprintf("%v", val))
 		}
 
 		if fmtCode == 1 { // binary format
