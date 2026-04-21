@@ -183,11 +183,43 @@ make test
 
 ## Test Results
 
-All tests pass:
+All tests pass (66+ total):
 
-- `pkg/pgwire` - Wire protocol message encoding/decoding tests
-- `internal/proxy/postgresql` - SQL translation tests (ILIKE, type casts, ON CONFLICT, date functions, JSON, arrays)
-- `internal/proxy/clickhouse` - CH SQL translation tests (FINAL, Map access, hasAny, date functions, aggregates)
+| Package | Tests | Description |
+|---------|-------|-------------|
+| `internal/config` | 6 | Config loading, defaults, env overrides |
+| `internal/proxy/clickhouse` | 28 | Buffer batching, type mapping, CH SQL translation |
+| `internal/proxy/postgresql` | 25+ | PG SQL translation, array conversion, pipeline tests |
+| `pkg/pgwire` | 7 | Wire protocol encode/decode |
+
+Test categories include: type casting, ILIKE, ON CONFLICT, RETURNING, date_trunc, EXTRACT, GENERATE_SERIES, JSONB functions, array operations, LIMIT 1 BY, LATERAL JOIN, to_tsvector, dollar parameters, string_agg, boolean operators, interval arithmetic, FINAL keyword, Map access, hasAny/hasAll/has, arrayJoin, toStartOf functions, dateDiff, aggregate functions (countIf/sumIf/uniq/groupArray/argMax), parameter substitution, cast expressions, and complex multi-feature queries.
+
+## Known Limitations & Bugs Fixed
+
+### Bugs Fixed During Development
+
+| Bug | Impact | Fix |
+|-----|--------|-----|
+| `(?=...)` lookahead regex | Panic in translateLateralJoin (Go RE2 unsupported) | Replaced with keyword-split approach |
+| `(?<!...)` lookbehind regex | Panic in translateBoolOperators (Go RE2 unsupported) | Removed lookbehind, simplified pattern |
+| Greedy `[^)]+` in to_tsvector | Wrong captures across nested parentheses | Multi-pass: handle plainto_tsquery first, then @@ |
+| pgTypeFromMySQL case order | "tinyint(1)" matched by "int" first | Reordered to check specific types before generic |
+| `float` matched by "int" | Float type returned Int64 | Used HasPrefix instead of Contains |
+| `rand.Seed` deprecated | Go 1.20+ deprecation warning | Migrated to math/rand/v2 + rand.IntN() |
+| SendDataRow default type | Panic on non-uint32 values | fmt.Sprintf("%v", val) fallback |
+| normalizeQuery empty string | Index out of range on empty input | Length guard before slice operation |
+| Duplicate `Enquery` method | Confusing duplicate of Enqueue | Removed |
+
+### Remaining Work
+
+- Integration tests: End-to-end PG wire protocol and CH HTTP proxy tests
+- Unit tests for `internal/mysql/` package
+- Unit tests for `pkg/chproto/` package
+- CH Native (TCP) protocol server: HTTP is functional, TCP needs full implementation
+- pg_catalog full emulation: Currently partial, needs complete pg_type, pg_class, pg_attribute, pg_index, pg_proc
+- Write buffer production hardening: Flush intervals, error handling, backpressure
+- Performance benchmarking and tuning
+- Prometheus metrics and observability
 
 ## Architecture
 

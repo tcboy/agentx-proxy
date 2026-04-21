@@ -19,12 +19,40 @@
 8. **postgresql/translator.go**: `translateReturning` produces multi-statement SQL that MySQL may not handle correctly
 9. Missing: `internal/proxy/clickhouse/native_server.go` as separate file (currently in http_server.go)
 
-### Plan
-1. Fix bugs and code quality issues
-2. Add more comprehensive unit tests
-3. Add config tests
-4. Add buffer/batch tests
-5. Add system handler tests
-6. Improve CH Native protocol robustness
-7. Improve PG translator for edge cases
-8. Write complete.md summary
+### Work Done
+1. **Removed duplicate method**: Deleted `Enquery` typo in buffer.go
+2. **Fixed rand deprecation**: Switched from `math/rand` + `rand.Seed` to `math/rand/v2` + `rand.IntN()`
+3. **Fixed SendDataRow**: Added `fmt.Sprintf("%v", val)` default case for arbitrary types
+4. **Fixed normalizeQuery**: Added length check before removing trailing null byte
+5. **Fixed executeMySQLQuery**: Added upfront `isWriteQuery()` check to use Exec for writes
+6. **Fixed translateLimit1By**: Rewrote to use ROW_NUMBER() OVER (PARTITION BY) CTE wrapping
+7. **Added translator methods**: translateDollarParams, translateStringAgg, translateBoolOperators, translateCoalesceInterval
+8. **Fixed RE2 regex compatibility**:
+   - `translateLateralJoin`: Replaced `(?=...)` lookahead with keyword-split approach
+   - `translateBoolOperators`: Removed `(?<!...)` negative lookbehind
+   - `translateToTsVector`: Fixed greedy regex crossing nested parentheses
+9. **Fixed pgTypeFromMySQL**: Corrected case ordering — specific types (tinyint, smallint, etc.) now match before generic "int"
+10. **Added comprehensive tests**: 60+ new tests across config, buffer, system, array, and translator packages
+
+### Test Results
+- All tests pass across 5 packages
+- config: 6 tests
+- clickhouse: 28 tests (buffer, system, translator)
+- postgresql: 25+ tests (translator, array)
+- pgwire: existing tests pass
+
+## 2026-04-21 - Session 2: Bug Fixes Completion & Documentation
+
+### Starting State
+- Previous session identified and fixed most bugs
+- All changes were uncommitted
+- Missing: commit, complete.md documentation
+
+### Work Done
+1. Committed all changes (commit 7cf4a83)
+2. Created complete.md documentation
+
+### Remaining Work
+- [ ] Add integration tests (PG wire protocol + CH HTTP end-to-end)
+- [ ] Add tests for `internal/mysql/` package
+- [ ] Improve CH Native (TCP) protocol handshake parsing
