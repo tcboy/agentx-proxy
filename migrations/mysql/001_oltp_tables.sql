@@ -1,0 +1,4 @@
+-- 001: OLTP Tables
+-- Generated from Langfuse Prisma schema
+-- These tables are automatically created by agentx-proxy on startup.
+-- This file is for reference only.

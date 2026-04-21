@@ -1,0 +1,62 @@
+# Translation Rules Configuration
+# Static translation rules for PG/CH -> MySQL
+
+pg_to_mysql:
+  # Type translations
+  types:
+    TEXT[]: JSON
+    VARCHAR[]: JSON
+    INT[]: JSON
+    INTEGER[]: JSON
+    JSONB: JSON
+    UUID: VARCHAR(36)
+    TIMESTAMPTZ: DATETIME(3)
+    BOOLEAN: TINYINT(1)
+
+  # Function translations
+  functions:
+    ILIKE: LIKE COLLATE utf8mb4_general_ci
+    date_trunc: DATE_FORMAT / DATE
+    EXTRACT_EPOCH: UNIX_TIMESTAMP
+    jsonb_set: JSON_SET
+    jsonb_agg: JSON_ARRAYAGG
+    jsonb_array_elements: JSON_TABLE
+
+  # Operator translations
+  operators:
+    arrow_arrow: JSON_UNQUOTE(JSON_EXTRACT())
+    arrow: JSON_EXTRACT()
+    ANY: JSON_CONTAINS()
+    overlap: JSON_OVERLAPS()
+    contains: JSON_CONTAINS()
+
+  # Array column handling
+  array_columns:
+    mode: json  # json | delimited
+
+ch_to_mysql:
+  # Function translations
+  functions:
+    FINAL: removed
+    LIMIT_BY: ROW_NUMBER approach
+    hasAny: JSON_OVERLAPS
+    hasAll: JSON_CONTAINS (each)
+    has: JSON_CONTAINS
+    arrayJoin: JSON_TABLE
+    toDate: DATE
+    toStartOfHour: DATE_FORMAT
+    dateDiff: TIMESTAMPDIFF
+    countIf: COUNT(CASE WHEN)
+    sumIf: SUM(CASE WHEN)
+    uniq: COUNT(DISTINCT)
+    groupArray: JSON_ARRAYAGG
+
+  # Aggregate function translations
+  aggregates:
+    SimpleAggregateFunction(min): MIN
+    SimpleAggregateFunction(max): MAX
+    SimpleAggregateFunction(anyLast): MAX
+    SimpleAggregateFunction(sumMap): JSON_MERGE_PATCH + sum
+    SimpleAggregateFunction(maxMap): JSON_MERGE_PATCH + max
+    SimpleAggregateFunction(groupUniqArrayArray): JSON_ARRAYAGG(DISTINCT)
+    AggregateFunction(argMax): GROUP_CONCAT + SUBSTRING_INDEX

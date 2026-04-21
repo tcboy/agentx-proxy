@@ -1,0 +1,4 @@
+-- 002: OLAP Tables
+-- Generated from ClickHouse migrations
+-- These tables are automatically created by agentx-proxy on startup.
+-- This file is for reference only.
