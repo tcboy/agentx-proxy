@@ -1,8 +1,11 @@
 package postgresql
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -131,14 +134,42 @@ func (s *Server) handleConn(conn net.Conn, connID int) {
 	slog.Info("new PG connection", "conn_id", connID, "remote", conn.RemoteAddr())
 	defer slog.Info("PG connection closed", "conn_id", connID)
 
-	// Read startup message
-	startup, err := state.r.ReadStartupMessage()
-	if err != nil {
-		slog.Error("read startup", "error", err)
+	// Handle SSLRequest - clients may ask for SSL upgrade before sending startup message
+	// Read 4 bytes length + 4 bytes protocol code
+	buf := make([]byte, 8)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		slog.Error("read startup probe", "error", err)
 		return
 	}
 
-	state.parameters = startup.Parameters
+	protocolCode := binary.BigEndian.Uint32(buf[4:])
+	if protocolCode == 1234<<16|5679 {
+		// SSLRequest - we don't support SSL, reply with 'N'
+		conn.Write([]byte{'N'})
+		// Now read the actual startup message
+	}
+
+	// Push back the first 8 bytes so ReadStartupMessage can read them
+	// We use a custom approach: create a combined reader
+	startupLen := binary.BigEndian.Uint32(buf[:4])
+	remaining := make([]byte, startupLen-4)
+	if _, err := io.ReadFull(conn, remaining); err != nil {
+		slog.Error("read startup params", "error", err)
+		return
+	}
+
+	// Combine and parse startup manually
+	allData := append(buf, remaining...)
+	params := make(map[string]string)
+	paramData := allData[8:] // skip length(4) + protocol(4)
+	if len(paramData) > 1 {
+		parts := bytes.Split(paramData[:len(paramData)-1], []byte{0})
+		for i := 0; i+1 < len(parts); i += 2 {
+			params[string(parts[i])] = string(parts[i+1])
+		}
+	}
+
+	state.parameters = params
 
 	// Authentication
 	if err := state.w.AuthenticationOK(); err != nil {
@@ -147,7 +178,7 @@ func (s *Server) handleConn(conn net.Conn, connID int) {
 	}
 
 	// Parameter status messages
-	params := map[string]string{
+	statusParams := map[string]string{
 		"server_version":          "14.0 (AgentX Proxy)",
 		"server_encoding":         "UTF8",
 		"client_encoding":         "UTF8",
@@ -159,7 +190,7 @@ func (s *Server) handleConn(conn net.Conn, connID int) {
 		"standard_conforming_strings": "on",
 	}
 
-	for k, v := range params {
+	for k, v := range statusParams {
 		state.w.SendParameterStatus(k, v)
 		state.parameters[k] = v
 	}

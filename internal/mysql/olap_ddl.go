@@ -6,11 +6,11 @@ var olapDDLs = []string{
 	`CREATE TABLE IF NOT EXISTS traces (
 		id VARCHAR(36) NOT NULL,
 		timestamp DATETIME(3) NOT NULL,
-		name VARCHAR(255),
+		` + bt + `name` + bt + ` VARCHAR(255),
 		user_id VARCHAR(36),
 		metadata JSON,
-		release VARCHAR(255),
-		version VARCHAR(255),
+		` + bt + `release` + bt + ` VARCHAR(255),
+		` + bt + `version` + bt + ` VARCHAR(255),
 		project_id VARCHAR(36) NOT NULL,
 		public TINYINT(1) NOT NULL DEFAULT 0,
 		bookmarked TINYINT(1) NOT NULL DEFAULT 0,
@@ -30,7 +30,7 @@ var olapDDLs = []string{
 		INDEX idx_session_id (project_id, session_id),
 		INDEX idx_user_id (project_id, user_id),
 		INDEX idx_environment (project_id, environment),
-		MULTI-VALUED INDEX idx_tags ((CAST(JSON_UNQUOTE(JSON_TABLE(tags, '$[*]' COLUMNS(tag VARCHAR(255) PATH '$')) AS CHAR(255))))
+		INDEX idx_tags ((CAST(JSON_EXTRACT(tags, '$[*]') AS CHAR(255) ARRAY)))
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
 	// Observations (from ReplacingMergeTree)
@@ -144,7 +144,7 @@ var olapDDLs = []string{
 		event_ts DATETIME(3) NOT NULL,
 		is_deleted TINYINT(1) NOT NULL DEFAULT 0,
 		PRIMARY KEY (id, project_id),
-		INDEX idx_project_path (project_id, file_path),
+		INDEX idx_project_path (project_id, file_path(255)),
 		INDEX idx_project_timestamp (project_id, created_at DESC)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
@@ -242,13 +242,13 @@ var olapDDLs = []string{
 	// Analytics views
 	`CREATE OR REPLACE VIEW analytics_traces AS
 	SELECT
-		DATE_FORMAT(start_time, '%Y-%m-%d %H:00:00') AS hour,
+		DATE_FORMAT(timestamp, '%Y-%m-%d %H:00:00') AS hour,
 		project_id,
 		COUNT(*) AS trace_count,
 		COUNT(DISTINCT user_id) AS unique_users,
 		COUNT(DISTINCT session_id) AS unique_sessions,
-		MAX(end_time) AS max_end_time,
-		MIN(start_time) AS min_start_time
+		MAX(updated_at) AS max_end_time,
+		MIN(timestamp) AS min_start_time
 	FROM traces
 	GROUP BY hour, project_id`,
 

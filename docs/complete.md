@@ -13,27 +13,43 @@ agentx-proxy/
 ├── internal/
 │   ├── config/
 │   │   └── config.go              # YAML config + env var overrides
+│   ├── translation/
+│   │   ├── rules.go               # YAML translation rules loader
+│   │   └── rules_test.go          # Translation rules tests
 │   ├── proxy/
 │   │   ├── postgresql/            # PG wire protocol proxy
 │   │   │   ├── server.go          # PG server: handshake, message routing
 │   │   │   ├── translator.go      # PG SQL -> MySQL SQL translation
 │   │   │   ├── catalog.go         # pg_catalog system table emulation
-│   │   │   └── array.go           # Array column <-> JSON mapping
+│   │   │   ├── array.go           # Array column <-> JSON mapping
+│   │   │   └── integration_test.go # PG wire integration tests
 │   │   └── clickhouse/            # CH protocol proxy
 │   │       ├── http_server.go     # CH HTTP + Native TCP servers
 │   │       ├── translator.go      # CH SQL -> MySQL SQL translation
+│   │       ├── translator_test.go # CH translator tests (56 total)
 │   │       ├── buffer.go          # Write buffer for batch inserts
-│   │       └── system.go          # system.tables/columns query handlers
+│   │       ├── system.go          # system.tables/columns query handlers
+│   │       └── system_test.go     # System query tests
 │   └── mysql/
 │       ├── pool.go                # MySQL connection pool
 │       ├── schema.go              # DDL execution & table management
-│       ├── oltp_ddl.go            # 50+ OLTP table definitions
-│       ├── olap_ddl.go            # OLAP tables + analytics views
-│       └── pg_catalog_ddl.go      # pg_catalog emulation tables
+│       ├── oltp_ddl.go            # 61 OLTP table definitions
+│       ├── olap_ddl.go            # 9 OLAP tables + analytics views
+│       └── pg_catalog_ddl.go      # 10 pg_catalog emulation tables
 ├── pkg/
 │   ├── pgwire/                    # PG wire protocol encoding/decoding
-│   └── chproto/                   # CH Native protocol constants
-├── migrations/mysql/              # MySQL initialization DDL
+│   │   ├── wire.go                # Reader: startup, messages, parsing
+│   │   ├── writer.go              # Writer: responses, data rows
+│   │   └── wire_test.go           # Wire tests
+│   └── chproto/                   # CH Native protocol
+│       ├── varint.go              # VarInt encoding/decoding
+│       └── varint_test.go         # VarInt tests
+├── migrations/
+│   ├── mysql/
+│   │   ├── 001_oltp_tables.sql    # 61 OLTP tables
+│   │   ├── 002_olap_tables.sql    # 9 OLAP tables + 5 views
+│   │   └── 003_pg_catalog_tables.sql  # 10 pg_catalog tables
+│   └── translation_rules.yaml     # PG/CH -> MySQL translation rules
 ├── docker/docker-compose.yml      # Dev environment (MySQL only)
 ├── config.yaml                    # Default configuration
 └── Makefile                       # Build & test commands
@@ -123,14 +139,17 @@ agentx-proxy/
 
 | Feature | Status | Implementation |
 |---------|--------|---------------|
-| OLTP Tables (50+) | Done | Translated from Prisma schema |
-| OLAP Tables | Done | Translated from CH migrations |
+| OLTP Tables (61) | Done | Translated from Prisma schema |
+| OLAP Tables (9) | Done | Translated from CH migrations |
+| pg_catalog Tables (10) | Done | System catalog emulation |
 | Aggregation Tables | Done | traces_all_amt, traces_7d_amt, traces_30d_amt |
 | Analytics Views | Done | analytics_traces/observations/scores |
 | Score Views | Done | scores_numeric, scores_categorical |
 | Auto-initialization | Done | Tables created on startup if not exists |
 | Array -> JSON Mapping | Done | All String[]/Int[] columns use JSON type |
 | Multi-valued Indexes | Done | JSON multi-valued indexes for array columns |
+| Migration SQL Files | Done | 001_oltp, 002_olap, 003_pg_catalog in migrations/mysql/ |
+| Translation Rules YAML | Done | migrations/translation_rules.yaml loaded by internal/translation |
 
 ## Configuration
 
@@ -183,14 +202,17 @@ make test
 
 ## Test Results
 
-All tests pass (66+ total):
+All tests pass (165+ total):
 
 | Package | Tests | Description |
 |---------|-------|-------------|
 | `internal/config` | 6 | Config loading, defaults, env overrides |
-| `internal/proxy/clickhouse` | 28 | Buffer batching, type mapping, CH SQL translation |
-| `internal/proxy/postgresql` | 25+ | PG SQL translation, array conversion, pipeline tests |
-| `pkg/pgwire` | 7 | Wire protocol encode/decode |
+| `internal/mysql` | 9 | Schema, pool, DDL extraction, table existence |
+| `internal/proxy/clickhouse` | 56 | Buffer, system, CH SQL translation (30+), Langfuse-specific queries |
+| `internal/proxy/postgresql` | 27 | PG SQL translation (18), wire integration (9) |
+| `internal/translation` | 4 | YAML loading, caching, error handling |
+| `pkg/chproto` | 6 | VarInt round-trips, encoding, string, fixed uint32/64 |
+| `pkg/pgwire` | 6 | Wire protocol encode/decode |
 
 Test categories include: type casting, ILIKE, ON CONFLICT, RETURNING, date_trunc, EXTRACT, GENERATE_SERIES, JSONB functions, array operations, LIMIT 1 BY, LATERAL JOIN, to_tsvector, dollar parameters, string_agg, boolean operators, interval arithmetic, FINAL keyword, Map access, hasAny/hasAll/has, arrayJoin, toStartOf functions, dateDiff, aggregate functions (countIf/sumIf/uniq/groupArray/argMax), parameter substitution, cast expressions, and complex multi-feature queries.
 
@@ -212,14 +234,9 @@ Test categories include: type casting, ILIKE, ON CONFLICT, RETURNING, date_trunc
 
 ### Remaining Work
 
-- Integration tests: End-to-end PG wire protocol and CH HTTP proxy tests
-- Unit tests for `internal/mysql/` package
-- Unit tests for `pkg/chproto/` package
-- CH Native (TCP) protocol server: HTTP is functional, TCP needs full implementation
-- pg_catalog full emulation: Currently partial, needs complete pg_type, pg_class, pg_attribute, pg_index, pg_proc
-- Write buffer production hardening: Flush intervals, error handling, backpressure
-- Performance benchmarking and tuning
+- Performance benchmarking and tuning (1000 QPS, p99 < 200ms target)
 - Prometheus metrics and observability
+- Langfuse E2E validation with live instance
 
 ## Architecture
 

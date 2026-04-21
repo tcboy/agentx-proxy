@@ -168,10 +168,14 @@ func (r *Reader) ReadStartupMessage() (*StartupMessage, error) {
 		return nil, err
 	}
 
+	// First 4 bytes are protocol version, rest is null-terminated parameters
 	params := make(map[string]string)
-	parts := bytes.Split(buf[:len(buf)-1], []byte{0}) // null-terminated pairs
-	for i := 0; i < len(parts)-1; i += 2 {
-		params[string(parts[i])] = string(parts[i+1])
+	paramData := buf[4:]
+	if len(paramData) > 1 {
+		parts := bytes.Split(paramData[:len(paramData)-1], []byte{0})
+		for i := 0; i+1 < len(parts); i += 2 {
+			params[string(parts[i])] = string(parts[i+1])
+		}
 	}
 
 	return &StartupMessage{

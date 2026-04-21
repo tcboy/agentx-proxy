@@ -303,13 +303,25 @@ func (t *CHTranslator) translateCHAggregateFunctions(sql string) string {
 	re = regexp.MustCompile(`(?i)histogram\s*\((\d+)\)\s*\(([^)]+)\)`)
 	sql = re.ReplaceAllString(sql, "HISTOGRAM($2)") // MySQL 8.0+
 
-	// SimpleAggregateFunction wrappers -> unwrap
-	re = regexp.MustCompile(`(?i)SimpleAggregateFunction\(\w+,\s*([^)]+)\)`)
-	sql = re.ReplaceAllString(sql, "$1")
+	// SimpleAggregateFunction(func, col) -> func(col)
+	re = regexp.MustCompile(`(?i)SimpleAggregateFunction\((\w+),\s*([^)]+)\)`)
+	sql = re.ReplaceAllStringFunc(sql, func(match string) string {
+		subMatches := re.FindStringSubmatch(match)
+		if len(subMatches) != 3 {
+			return match
+		}
+		return fmt.Sprintf("%s(%s)", subMatches[1], subMatches[2])
+	})
 
-	// AggregateFunction wrappers -> unwrap
-	re = regexp.MustCompile(`(?i)AggregateFunction\(\w+,\s*([^)]+)\)`)
-	sql = re.ReplaceAllString(sql, "$1")
+	// AggregateFunction(func, col) -> func(col)
+	re = regexp.MustCompile(`(?i)AggregateFunction\((\w+),\s*([^)]+)\)`)
+	sql = re.ReplaceAllStringFunc(sql, func(match string) string {
+		subMatches := re.FindStringSubmatch(match)
+		if len(subMatches) != 3 {
+			return match
+		}
+		return fmt.Sprintf("%s(%s)", subMatches[1], subMatches[2])
+	})
 
 	// argMaxState -> argMax
 	re = regexp.MustCompile(`(?i)argMaxState\s*\(([^,]+),\s*([^)]+)\)`)
@@ -355,7 +367,7 @@ func (t *CHTranslator) translateTuple(sql string) string {
 
 func (t *CHTranslator) translateHasFunctions(sql string) string {
 	// hasAny(arr, ['x', 'y']) -> JSON_OVERLAPS(arr, '["x","y"]')
-	re := regexp.MustCompile(`(?i)hasAny\s*\((\w+),\s*\[([^\]]*)\]\)`)
+	re := regexp.MustCompile(`(?i)hasAny\s*\(([\w.]+),\s*\[([^\]]*)\]\)`)
 	sql = re.ReplaceAllStringFunc(sql, func(match string) string {
 		subMatches := re.FindStringSubmatch(match)
 		if len(subMatches) != 3 {
@@ -367,7 +379,7 @@ func (t *CHTranslator) translateHasFunctions(sql string) string {
 	})
 
 	// hasAll(arr, ['x', 'y']) -> JSON_CONTAINS for each
-	re = regexp.MustCompile(`(?i)hasAll\s*\((\w+),\s*\[([^\]]*)\]\)`)
+	re = regexp.MustCompile(`(?i)hasAll\s*\(([\w.]+),\s*\[([^\]]*)\]\)`)
 	sql = re.ReplaceAllStringFunc(sql, func(match string) string {
 		subMatches := re.FindStringSubmatch(match)
 		if len(subMatches) != 3 {
@@ -384,15 +396,15 @@ func (t *CHTranslator) translateHasFunctions(sql string) string {
 	})
 
 	// has(arr, 'x') -> JSON_CONTAINS
-	re = regexp.MustCompile(`(?i)\bhas\s*\((\w+),\s*([^)]+)\)`)
+	re = regexp.MustCompile(`(?i)\bhas\s*\(([\w.]+),\s*([^)]+)\)`)
 	sql = re.ReplaceAllString(sql, "JSON_CONTAINS($1, $2)")
 
 	// empty(arr) -> JSON_LENGTH = 0
-	re = regexp.MustCompile(`(?i)\bempty\s*\((\w+)\)`)
+	re = regexp.MustCompile(`(?i)\bempty\s*\(([\w.]+)\)`)
 	sql = re.ReplaceAllString(sql, "(JSON_LENGTH($1) = 0)")
 
 	// notEmpty(arr) -> JSON_LENGTH > 0
-	re = regexp.MustCompile(`(?i)\bnotEmpty\s*\((\w+)\)`)
+	re = regexp.MustCompile(`(?i)\bnotEmpty\s*\(([\w.]+)\)`)
 	sql = re.ReplaceAllString(sql, "(JSON_LENGTH($1) > 0)")
 
 	return sql

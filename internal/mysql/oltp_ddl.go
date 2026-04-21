@@ -1,6 +1,7 @@
 package mysql
 
 // oltpDDLs contains MySQL DDL translated from Langfuse Prisma schema
+const bt = "`"
 var oltpDDLs = []string{
 	// NextAuth / Auth
 	`CREATE TABLE IF NOT EXISTS accounts (
@@ -357,8 +358,8 @@ var oltpDDLs = []string{
 		resource_type VARCHAR(255) NOT NULL,
 		resource_id VARCHAR(255) NOT NULL,
 		action VARCHAR(255) NOT NULL,
-		before TEXT,
-		after TEXT,
+		` + bt + `before` + bt + ` TEXT,
+		` + bt + `after` + bt + ` TEXT,
 		api_key_id VARCHAR(36),
 		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 		INDEX idx_org_created (org_id, created_at DESC)
@@ -499,7 +500,7 @@ var oltpDDLs = []string{
 		id VARCHAR(36) PRIMARY KEY,
 		project_id VARCHAR(36) NOT NULL,
 		name VARCHAR(255) NOT NULL,
-		schema JSON NOT NULL,
+		` + bt + `schema` + bt + ` JSON NOT NULL,
 		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 		UNIQUE KEY uk_project_name (project_id, name)

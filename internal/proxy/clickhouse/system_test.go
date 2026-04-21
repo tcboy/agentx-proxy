@@ -38,35 +38,6 @@ func TestMysqlToCHType(t *testing.T) {
 	}
 }
 
-func TestPgTypeFromMySQL(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"tinyint(1)", "UInt8"},
-		{"smallint", "Int16"},
-		{"mediumint", "Int24"},
-		{"bigint", "Int64"},
-		// Note: "int" and "integer" match before "tinyint(1)" check in the function
-		{"decimal(65,30)", "Decimal64(12)"},
-		{"float", "Float32"},
-		{"double", "Float64"},
-		{"datetime(3)", "DateTime64(3)"},
-		{"date", "Date"},
-		{"json", "Map(LowCardinality(String), String)"},
-		{"longtext", "String"},
-		{"varchar(255)", "String"},
-		{"text", "String"},
-	}
-
-	for _, tc := range tests {
-		result := pgTypeFromMySQL(tc.input)
-		if result != tc.expected {
-			t.Errorf("pgTypeFromMySQL(%q) = %q, want %q", tc.input, result, tc.expected)
-		}
-	}
-}
-
 func TestIsWriteQuery(t *testing.T) {
 	tests := []struct {
 		input    string

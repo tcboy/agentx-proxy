@@ -84,8 +84,9 @@ func extractTableName(ddl string) string {
 		if strings.EqualFold(p, "TABLE") && i+1 < len(parts) {
 			next := parts[i+1]
 			if strings.EqualFold(next, "IF") {
-				if i+3 < len(parts) {
-					return stripQuotes(parts[i+3])
+				// CREATE TABLE IF NOT EXISTS name -> skip IF, NOT, EXISTS
+				if i+4 < len(parts) {
+					return stripQuotes(parts[i+4])
 				}
 			}
 			return stripQuotes(next)

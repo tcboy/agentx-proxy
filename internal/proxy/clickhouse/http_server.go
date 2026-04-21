@@ -1,8 +1,10 @@
 package clickhouse
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/agentx-labs/agentx-proxy/internal/config"
 	"github.com/agentx-labs/agentx-proxy/internal/mysql"
+	"github.com/agentx-labs/agentx-proxy/pkg/chproto"
 )
 
 // HTTPServer implements ClickHouse HTTP interface proxy
@@ -254,7 +257,6 @@ func (s *HTTPServer) getSystemTables() string {
 	defer rows.Close()
 
 	cols := []string{"database", "name", "engine", "is_temporary", "data_paths", "metadata_path", "metadata_modification_time", "metadata_version", "storage_policy", "delayed_insert_threads", "parts", "active_parts", "total_marks", "total_rows", "total_bytes", "lifetime_rows", "lifetime_bytes"}
-	_ = cols
 
 	var result strings.Builder
 	result.WriteString(strings.Join(cols, "\t") + "\n")
@@ -291,7 +293,7 @@ func (s *HTTPServer) getSystemColumns() string {
 		var nullable, defaultVal *string
 		rows.Scan(&table, &name, &colType, &nullable, &defaultVal)
 
-		chType := pgTypeFromMySQL(colType)
+		chType := mysqlToCHType(colType)
 		result.WriteString(fmt.Sprintf("default\t%s\t%s\t%s\t\t\t\t\n", table, name, chType))
 	}
 
@@ -299,7 +301,6 @@ func (s *HTTPServer) getSystemColumns() string {
 }
 
 func (s *HTTPServer) existsTable(query string) string {
-	// Extract table name from EXISTS TABLE <name>
 	parts := strings.Fields(query)
 	if len(parts) >= 4 {
 		tableName := parts[len(parts)-1]
@@ -317,41 +318,6 @@ func (s *HTTPServer) existsTable(query string) string {
 	return "0\n"
 }
 
-func pgTypeFromMySQL(mysqlType string) string {
-	lower := strings.ToLower(mysqlType)
-	switch {
-	case strings.HasPrefix(lower, "tinyint(1)"):
-		return "UInt8"
-	case strings.HasPrefix(lower, "smallint"):
-		return "Int16"
-	case strings.HasPrefix(lower, "mediumint"):
-		return "Int24"
-	case strings.HasPrefix(lower, "bigint"):
-		return "Int64"
-	case strings.HasPrefix(lower, "int"), strings.HasPrefix(lower, "integer"):
-		return "Int32"
-	case strings.HasPrefix(lower, "decimal"):
-		return "Decimal64(12)"
-	case strings.HasPrefix(lower, "float"):
-		return "Float32"
-	case strings.HasPrefix(lower, "double"):
-		return "Float64"
-	case strings.HasPrefix(lower, "datetime"):
-		return "DateTime64(3)"
-	case strings.HasPrefix(lower, "date"):
-		return "Date"
-	case strings.HasPrefix(lower, "json"):
-		return "Map(LowCardinality(String), String)"
-	case strings.HasPrefix(lower, "longtext"), strings.HasPrefix(lower, "mediumtext"),
-		strings.HasPrefix(lower, "text"):
-		return "String"
-	case strings.HasPrefix(lower, "varchar"), strings.HasPrefix(lower, "char"):
-		return "String"
-	default:
-		return "String"
-	}
-}
-
 func isWriteQuery(q string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(q))
 	return strings.HasPrefix(upper, "INSERT") ||
@@ -362,6 +328,8 @@ func isWriteQuery(q string) bool {
 		strings.HasPrefix(upper, "DROP") ||
 		strings.HasPrefix(upper, "TRUNCATE")
 }
+
+// --- Native Server (CH TCP Protocol with proper VarInt encoding) ---
 
 // NativeServer implements ClickHouse Native (TCP) protocol proxy
 type NativeServer struct {
@@ -427,148 +395,228 @@ func (s *NativeServer) Close() error {
 	return nil
 }
 
+// chConn wraps a net.Conn with buffered I/O implementing ByteReader/ByteWriter.
+type chConn struct {
+	net.Conn
+	br *bufio.Reader
+	bw *bufio.Writer
+}
+
+func newCHConn(c net.Conn) *chConn {
+	return &chConn{
+		Conn: c,
+		br:   bufio.NewReaderSize(c, 64*1024),
+		bw:   bufio.NewWriterSize(c, 64*1024),
+	}
+}
+
+func (c *chConn) ReadByte() (byte, error) {
+	return c.br.ReadByte()
+}
+
+func (c *chConn) WriteByte(b byte) error {
+	return c.bw.WriteByte(b)
+}
+
+func (c *chConn) Read(p []byte) (int, error) {
+	return c.br.Read(p)
+}
+
+func (c *chConn) Write(p []byte) (int, error) {
+	return c.bw.Write(p)
+}
+
+func (c *chConn) Flush() error {
+	return c.bw.Flush()
+}
+
+// byteReaderFrom wraps an io.Reader to io.ByteReader.
+type byteReaderFrom struct {
+	r io.Reader
+}
+
+func (b *byteReaderFrom) ReadByte() (byte, error) {
+	var buf [1]byte
+	_, err := io.ReadFull(b.r, buf[:])
+	return buf[0], err
+}
+
 func (s *NativeServer) handleConn(conn net.Conn, connID int) {
 	defer conn.Close()
+
+	ch := newCHConn(conn)
 
 	slog.Info("new CH native connection", "conn_id", connID, "remote", conn.RemoteAddr())
 	defer slog.Info("CH native connection closed", "conn_id", connID)
 
-	// CH Native protocol handshake
-	// Read client hello
-	buf := make([]byte, 1024)
-	_, err := conn.Read(buf)
+	// --- Handshake ---
+	// Client sends: version(uint32 LE), minor_version(uint32 LE), revision(uint32 LE),
+	//               default_db(VarInt string), user(VarInt string), password(VarInt string)
+	br := &byteReaderFrom{r: ch.br}
+	clientVersion, err := chproto.ReadFixedUint32(br)
 	if err != nil {
-		slog.Error("read CH hello", "error", err)
+		slog.Error("read CH client version", "error", err)
 		return
 	}
+	_, _ = chproto.ReadFixedUint32(br) // minor version
+	clientRevision, _ := chproto.ReadFixedUint32(br)
 
-	// Send server hello
-	serverHello := []byte{
-		0xDC, 0xD4, 0x00, 0x00, // Version: 54460
+	_, _ = chproto.ReadString(br) // default_db
+	user, _ := chproto.ReadString(br)
+	_, _ = chproto.ReadString(br) // password
+
+	slog.Info("CH native handshake", "conn_id", connID, "client_version", clientVersion, "client_revision", clientRevision, "user", user)
+
+	// Server responds: version(uint32 LE), display_name(VarInt string),
+	//                  revision(uint32 LE), timezone(VarInt string)
+	if err := chproto.WriteFixedUint32(ch.bw, chproto.ProtoVersion); err != nil {
+		return
 	}
-	// Write version + server name + revision
-	conn.Write(serverHello)
-	conn.Write([]byte{byte(len("AgentX Proxy"))})
-	conn.Write([]byte("AgentX Proxy"))
-	conn.Write([]byte{0x00, 0x00}) // Minor version
-	conn.Write([]byte{0x01, 0x00, 0x00, 0x00}) // Revision: 54461
+	if err := chproto.WriteString(ch.bw, chproto.ProtoDisplayName); err != nil {
+		return
+	}
+	if err := chproto.WriteFixedUint32(ch.bw, chproto.ProtoRevision); err != nil {
+		return
+	}
+	if err := chproto.WriteString(ch.bw, chproto.ProtoTimezone); err != nil {
+		return
+	}
+	ch.Flush()
 
-	// Process queries
+	// --- Process queries ---
 	for {
-		// Read packet type
-		packetType := make([]byte, 1)
-		if _, err := conn.Read(packetType); err != nil {
+		packetType, err := ch.br.ReadByte()
+		if err != nil {
 			return
 		}
 
-		switch packetType[0] {
-		case 1: // Query
-			s.handleCHQuery(conn, connID)
-		case 2: // Data
-			// Skip data
-		case 6: // Cancel
+		switch packetType {
+		case chproto.PacketQuery:
+			s.handleCHQuery(ch, connID)
+		case chproto.PacketData:
+			s.skipBlock(ch)
+		case chproto.PacketCancel:
 			return
-		case 7: // Hello
-			// Already handled
+		case chproto.PacketPing:
+			ch.WriteByte(chproto.ServerPacketPong)
+			ch.Flush()
+		case chproto.PacketHello:
+			// Re-handshake (some clients re-send hello)
+			s.handleReHandshake(ch)
+			ch.Flush()
 		default:
-			slog.Warn("unknown CH packet", "type", packetType[0])
+			slog.Warn("unknown CH packet", "conn_id", connID, "type", packetType)
 		}
 	}
 }
 
-func (s *NativeServer) handleCHQuery(conn net.Conn, connID int) error {
-	// Read query stage
-	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err != nil {
-		return err
-	}
+func (s *NativeServer) handleReHandshake(ch *chConn) {
+	br := &byteReaderFrom{r: ch.br}
+	_, _ = chproto.ReadFixedUint32(br)
+	_, _ = chproto.ReadFixedUint32(br)
+	_, _ = chproto.ReadFixedUint32(br)
+	_, _ = chproto.ReadString(br)
+	_, _ = chproto.ReadString(br)
+	_, _ = chproto.ReadString(br)
 
-	// Read query type
-	if _, err := conn.Read(buf); err != nil {
-		return err
-	}
+	chproto.WriteFixedUint32(ch.bw, chproto.ProtoVersion)
+	chproto.WriteString(ch.bw, chproto.ProtoDisplayName)
+	chproto.WriteFixedUint32(ch.bw, chproto.ProtoRevision)
+	chproto.WriteString(ch.bw, chproto.ProtoTimezone)
+}
 
-	// Read query ID length and value
-	idLen := make([]byte, 1)
-	if _, err := conn.Read(idLen); err != nil {
-		return err
-	}
-	queryID := make([]byte, idLen[0])
-	if _, err := conn.Read(queryID); err != nil {
-		return err
-	}
+func (s *NativeServer) handleCHQuery(ch *chConn, connID int) error {
+	// Read query fields (VarInt-encoded strings and integers)
+	queryID, _ := chproto.ReadString(ch.br)
+	_ = queryID
 
-	// Read query stage
-	if _, err := conn.Read(buf); err != nil {
-		return err
-	}
+	stage, _ := chproto.ReadVarInt(ch.br)
+	_ = stage
+
+	compression, _ := chproto.ReadVarInt(ch.br)
+	_ = compression
 
 	// Read client info
-	if _, err := conn.Read(buf); err != nil {
-		return err
+	_, _ = chproto.ReadVarInt(ch.br) // interface version
+	_, _ = chproto.ReadString(ch.br) // client name
+	_, _ = chproto.ReadVarInt(ch.br) // major
+	_, _ = chproto.ReadVarInt(ch.br) // minor
+	_, _ = chproto.ReadVarInt(ch.br) // patch
+	_, _ = chproto.ReadVarInt(ch.br) // revision
+	_, _ = chproto.ReadString(ch.br) // timezone
+	_, _ = chproto.ReadVarInt(ch.br) // quota key
+	_, _ = chproto.ReadVarInt(ch.br) // distributed depth
+
+	// Read initial query
+	query, _ := chproto.ReadString(ch.br)
+
+	// Read secondary query if present
+	kind, _ := chproto.ReadVarInt(ch.br)
+	if kind == chproto.QuerySecondary {
+		secondaryQuery, _ := chproto.ReadString(ch.br)
+		if secondaryQuery != "" {
+			query = secondaryQuery
+		}
 	}
 
-	// Read query
-	queryLenBytes := make([]byte, 4)
-	if _, err := conn.Read(queryLenBytes); err != nil {
-		return err
+	if compression == chproto.CompressionEnabled {
+		// Skip 4-byte compressed size header; for now assume no actual compression
+		_, _ = ch.br.ReadByte()
+		_, _ = ch.br.ReadByte()
+		_, _ = ch.br.ReadByte()
+		_, _ = ch.br.ReadByte()
 	}
 
-	// Handle empty queries
-	queryLen := int(queryLenBytes[3])<<24 | int(queryLenBytes[2])<<16 | int(queryLenBytes[1])<<8 | int(queryLenBytes[0])
-	if queryLen > 1000000 {
-		// Probably a different encoding - read until we find something reasonable
-		queryLen = 1024
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return s.sendEmptyBlock(ch)
 	}
 
-	queryBuf := make([]byte, queryLen)
-	n, err := conn.Read(queryBuf)
-	if err != nil {
-		return err
-	}
-
-	query := string(queryBuf[:n])
 	slog.Debug("CH native query", "conn_id", connID, "sql", query)
 
 	// Handle system queries
 	if resp := s.handleSystemQueryNative(query); resp != nil {
-		return s.sendCHResponse(conn, resp)
+		return s.sendNativeResponse(ch, resp)
 	}
 
 	// Translate and execute
 	translated, err := s.translator.Translate(query)
 	if err != nil {
-		return s.sendCHError(conn, err.Error())
+		return s.sendNativeError(ch, err.Error())
 	}
 
 	slog.Debug("CH native translated", "original", query, "translated", translated)
 
-	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if isWriteQuery(translated) {
 		if strings.HasPrefix(strings.ToUpper(translated), "INSERT") {
 			s.buffer.Enqueue(translated)
-			return s.sendCHProgress(conn)
+			return s.sendNativeProgress(ch)
 		}
 
 		result, err := s.pool.Exec(ctx, translated)
 		if err != nil {
-			return s.sendCHError(conn, err.Error())
+			return s.sendNativeError(ch, err.Error())
 		}
 
 		affected, _ := result.RowsAffected()
-		return s.sendCHComplete(conn, affected)
+		return s.sendNativeComplete(ch, affected)
 	}
 
 	rows, err := s.pool.Query(ctx, translated)
 	if err != nil {
-		return s.sendCHError(conn, err.Error())
+		return s.sendNativeError(ch, err.Error())
 	}
 	defer rows.Close()
 
-	return s.sendCHData(conn, rows)
+	return s.sendNativeData(ch, rows)
+}
+
+func (s *NativeServer) skipBlock(ch *chConn) {
+	_, _ = chproto.ReadVarInt(ch.br)  // num_columns
+	_, _ = chproto.ReadVarInt(ch.br) // num_rows
 }
 
 func (s *NativeServer) handleSystemQueryNative(query string) *nativeResponse {
@@ -576,19 +624,26 @@ func (s *NativeServer) handleSystemQueryNative(query string) *nativeResponse {
 
 	if strings.Contains(upper, "VERSION()") {
 		return &nativeResponse{
-			columns: []string{"version()"},
-			rows:    [][]interface{}{{"24.8.5.115"}},
+			columns: []nativeColumn{{"version()", "String"}},
+			rows:    [][]interface{}{{chproto.ProtoDBMSVersion}},
 		}
 	}
 
 	if strings.Contains(upper, "CURRENTUSER()") || strings.Contains(upper, "CURRENT_USER()") {
 		return &nativeResponse{
-			columns: []string{"currentUser()"},
+			columns: []nativeColumn{{"currentUser()", "String"}},
 			rows:    [][]interface{}{{"default"}},
 		}
 	}
 
-	if upper == "SHOW TABLES" {
+	if strings.Contains(upper, "DATABASE()") {
+		return &nativeResponse{
+			columns: []nativeColumn{{"database()", "String"}},
+			rows:    [][]interface{}{{"default"}},
+		}
+	}
+
+	if upper == "SHOW TABLES" || upper == "SHOW TABLES FROM default" {
 		tables := getTableList(s.pool)
 		rows := [][]interface{}{}
 		for _, t := range strings.Split(strings.TrimSpace(tables), "\n") {
@@ -597,140 +652,263 @@ func (s *NativeServer) handleSystemQueryNative(query string) *nativeResponse {
 			}
 		}
 		return &nativeResponse{
-			columns: []string{"name"},
+			columns: []nativeColumn{{"name", "String"}},
 			rows:    rows,
 		}
+	}
+
+	if strings.Contains(upper, "SHOW DATABASES") {
+		return &nativeResponse{
+			columns: []nativeColumn{{"name", "String"}},
+			rows:    [][]interface{}{{"default"}, {"information_schema"}},
+		}
+	}
+
+	if strings.Contains(upper, "SYSTEM.TABLES") {
+		return s.getNativeSystemTables()
+	}
+
+	if strings.Contains(upper, "SYSTEM.COLUMNS") {
+		return s.getNativeSystemColumns()
+	}
+
+	if strings.HasPrefix(upper, "EXISTS") {
+		return s.nativeExistsTable(query)
 	}
 
 	return nil
 }
 
 type nativeResponse struct {
-	columns []string
+	columns []nativeColumn
 	rows    [][]interface{}
 }
 
-func (s *NativeServer) sendCHResponse(conn net.Conn, resp *nativeResponse) error {
-	// Send columns (Packet type 4 - Data)
-	conn.Write([]byte{0x04}) // Data packet
+type nativeColumn struct {
+	Name string
+	Type string
+}
 
-	// Block structure: read, write, skip info, columns, rows
-	conn.Write([]byte{0x00}) // read
-	conn.Write([]byte{0x00}) // write
-	conn.Write([]byte{0x00}) // skip info
+func (s *NativeServer) sendEmptyBlock(ch *chConn) error {
+	ch.WriteByte(chproto.ServerPacketData)
+	chproto.WriteVarInt(ch.bw, 0) // num_columns
+	chproto.WriteVarInt(ch.bw, 0) // num_rows
+	return ch.Flush()
+}
 
-	// Columns
-	conn.Write([]byte{byte(len(resp.columns))})
+func (s *NativeServer) sendNativeResponse(ch *chConn, resp *nativeResponse) error {
+	// Send progress
+	ch.WriteByte(chproto.ServerPacketProgress)
+	chproto.WriteVarInt(ch.bw, 0) // rows
+	chproto.WriteVarInt(ch.bw, 0) // blocks
+	chproto.WriteVarInt(ch.bw, 0) // bytes
+
+	// Send data block
+	ch.WriteByte(chproto.ServerPacketData)
+	chproto.WriteVarInt(ch.bw, uint64(len(resp.columns))) // num_columns
+	chproto.WriteVarInt(ch.bw, uint64(len(resp.rows)))    // num_rows
+
+	// Column names
 	for _, col := range resp.columns {
-		conn.Write([]byte(col))
-		conn.Write([]byte{0x00}) // type
-		conn.Write([]byte{0x00}) // collation
+		chproto.WriteString(ch.bw, col.Name)
 	}
-
-	// Rows
-	conn.Write([]byte{byte(len(resp.rows))})
+	// Column types
+	for _, col := range resp.columns {
+		chproto.WriteString(ch.bw, col.Type)
+	}
+	// Serialization info (0 = default text)
+	for range resp.columns {
+		chproto.WriteVarInt(ch.bw, 0)
+	}
+	// Row data (columnar: each column's values together)
 	for _, row := range resp.rows {
 		for _, val := range row {
-			str := fmt.Sprintf("%v", val)
-			conn.Write([]byte(str))
+			chproto.WriteString(ch.bw, fmt.Sprintf("%v", val))
 		}
 	}
 
-	// Send progress (type 5)
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-
-	// Send end of stream (type 2)
-	conn.Write([]byte{0x02})
-
-	return nil
-}
-
-func (s *NativeServer) sendCHProgress(conn net.Conn) error {
-	// Progress packet
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 	// End of stream
-	conn.Write([]byte{0x02})
-	return nil
+	ch.WriteByte(chproto.ServerPacketEndOfStream)
+	return ch.Flush()
 }
 
-func (s *NativeServer) sendCHComplete(conn net.Conn, affected int64) error {
+func (s *NativeServer) sendNativeProgress(ch *chConn) error {
+	ch.WriteByte(chproto.ServerPacketProgress)
+	chproto.WriteVarInt(ch.bw, 0)
+	chproto.WriteVarInt(ch.bw, 0)
+	chproto.WriteVarInt(ch.bw, 0)
+	ch.WriteByte(chproto.ServerPacketEndOfStream)
+	return ch.Flush()
+}
+
+func (s *NativeServer) sendNativeComplete(ch *chConn, affected int64) error {
+	ch.WriteByte(chproto.ServerPacketProgress)
+	chproto.WriteVarInt(ch.bw, uint64(affected))
+	chproto.WriteVarInt(ch.bw, 1)
+	chproto.WriteVarInt(ch.bw, 0)
+	ch.WriteByte(chproto.ServerPacketEndOfStream)
+	return ch.Flush()
+}
+
+func (s *NativeServer) sendNativeError(ch *chConn, msg string) error {
+	ch.WriteByte(chproto.ServerPacketException)
+	chproto.WriteFixedUint32(ch.bw, 0) // code
+	chproto.WriteString(ch.bw, msg)    // message
+	chproto.WriteString(ch.bw, "")     // display name
+	chproto.WriteString(ch.bw, "")     // stack trace
+	ch.WriteByte(0)                    // no cause
+	ch.WriteByte(chproto.ServerPacketEndOfStream)
+	return ch.Flush()
+}
+
+func (s *NativeServer) sendNativeData(ch *chConn, rows *sql.Rows) error {
 	// Progress
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, byte(affected), 0x00, 0x00})
-	// Profile info
-	conn.Write([]byte{0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	// End of stream
-	conn.Write([]byte{0x02})
-	return nil
-}
+	ch.WriteByte(chproto.ServerPacketProgress)
+	chproto.WriteVarInt(ch.bw, 0)
+	chproto.WriteVarInt(ch.bw, 0)
+	chproto.WriteVarInt(ch.bw, 0)
 
-func (s *NativeServer) sendCHError(conn net.Conn, msg string) error {
-	// Exception packet (type 0x00)
-	conn.Write([]byte{0x00})
-	conn.Write([]byte{byte(len(msg))})
-	conn.Write([]byte(msg))
-	conn.Write([]byte{0x00}) // display name
-	conn.Write([]byte{0x00}) // stack trace
-	conn.Write([]byte{0x02}) // no cause
-	return nil
-}
-
-func (s *NativeServer) sendCHData(conn net.Conn, rows *sql.Rows) error {
-	// Send progress
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-
-	// Get columns
 	colTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return s.sendCHError(conn, err.Error())
+		return s.sendNativeError(ch, err.Error())
 	}
 
 	colNames, err := rows.Columns()
 	if err != nil {
-		return s.sendCHError(conn, err.Error())
+		return s.sendNativeError(ch, err.Error())
 	}
 
-	// Send block with column info
-	conn.Write([]byte{0x04}) // Data
-	conn.Write([]byte{0x00}) // read
-	conn.Write([]byte{0x00}) // write
-	conn.Write([]byte{0x00}) // skip info
-	conn.Write([]byte{byte(len(colTypes))})
+	numCols := len(colTypes)
 
-	for i, ct := range colTypes {
-		name := colNames[i]
-		conn.Write([]byte(name))
-		// Simple type encoding
-		conn.Write([]byte("String"))
-		conn.Write([]byte{0x00})
-		_ = ct
-	}
-
-	rowCount := 0
+	// Collect all rows
+	var allRows [][]interface{}
 	for rows.Next() {
-		values := make([]interface{}, len(colTypes))
-		valuePtrs := make([]interface{}, len(colTypes))
+		values := make([]interface{}, numCols)
+		valuePtrs := make([]interface{}, numCols)
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}
-
 		if err := rows.Scan(valuePtrs...); err != nil {
-			return err
+			return s.sendNativeError(ch, err.Error())
 		}
-
-		// Write row data
-		for _, v := range values {
-			str := ""
-			if v != nil {
-				str = fmt.Sprintf("%v", v)
-			}
-			conn.Write([]byte{byte(len(str))})
-			conn.Write([]byte(str))
-		}
-		rowCount++
+		allRows = append(allRows, values)
 	}
 
-	// End of stream
-	conn.Write([]byte{0x02})
+	// Data block header
+	ch.WriteByte(chproto.ServerPacketData)
+	chproto.WriteVarInt(ch.bw, uint64(numCols))
+	chproto.WriteVarInt(ch.bw, uint64(len(allRows)))
 
-	return nil
+	// Column names
+	for i := 0; i < numCols; i++ {
+		chproto.WriteString(ch.bw, colNames[i])
+	}
+	// Column types
+	for i := 0; i < numCols; i++ {
+		chproto.WriteString(ch.bw, mysqlToCHType(colTypes[i].DatabaseTypeName()))
+	}
+	// Serialization info
+	for i := 0; i < numCols; i++ {
+		chproto.WriteVarInt(ch.bw, 0)
+	}
+
+	// Columnar data: each column's values in order
+	for col := 0; col < numCols; col++ {
+		for _, row := range allRows {
+			str := ""
+			if row[col] != nil {
+				str = fmt.Sprintf("%v", row[col])
+			}
+			chproto.WriteString(ch.bw, str)
+		}
+	}
+
+	ch.WriteByte(chproto.ServerPacketEndOfStream)
+	return ch.Flush()
 }
+
+func (s *NativeServer) getNativeSystemTables() *nativeResponse {
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx, `
+		SELECT table_name FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	columns := []nativeColumn{
+		{"database", "String"}, {"name", "String"}, {"engine", "String"},
+		{"is_temporary", "UInt8"}, {"data_paths", "String"}, {"metadata_path", "String"},
+		{"metadata_modification_time", "DateTime64(3)"}, {"metadata_version", "UInt64"},
+		{"storage_policy", "String"}, {"delayed_insert_threads", "UInt64"},
+		{"parts", "UInt64"}, {"active_parts", "UInt64"}, {"total_marks", "UInt64"},
+		{"total_rows", "UInt64"}, {"total_bytes", "UInt64"},
+	}
+
+	var result [][]interface{}
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		result = append(result, []interface{}{
+			"default", name, "MergeTree", uint8(0), "", "",
+			"1970-01-01 00:00:00.000", uint64(0), "", uint64(0),
+			uint64(0), uint64(0), uint64(0), uint64(0), uint64(0),
+		})
+	}
+
+	return &nativeResponse{columns: columns, rows: result}
+}
+
+func (s *NativeServer) getNativeSystemColumns() *nativeResponse {
+	ctx := context.Background()
+	rows, err := s.pool.Query(ctx, `
+		SELECT table_name, column_name, column_type
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE()
+		ORDER BY table_name, ordinal_position
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	columns := []nativeColumn{
+		{"database", "String"}, {"table", "String"}, {"name", "String"},
+		{"type", "String"}, {"default_expression", "String"},
+		{"comment", "String"}, {"codec_expression", "String"}, {"default_type", "String"},
+	}
+
+	var result [][]interface{}
+	for rows.Next() {
+		var table, name, colType string
+		rows.Scan(&table, &name, &colType)
+		chType := mysqlToCHType(colType)
+		result = append(result, []interface{}{"default", table, name, chType, "", "", "", ""})
+	}
+
+	return &nativeResponse{columns: columns, rows: result}
+}
+
+func (s *NativeServer) nativeExistsTable(query string) *nativeResponse {
+	parts := strings.Fields(query)
+	if len(parts) >= 4 {
+		tableName := strings.Trim(parts[len(parts)-1], "`")
+		ctx := context.Background()
+		exists, err := s.pool.TableExists(ctx, tableName)
+		if err == nil && exists {
+			return &nativeResponse{
+				columns: []nativeColumn{{"result", "UInt8"}},
+				rows:    [][]interface{}{{uint8(1)}},
+			}
+		}
+	}
+	return &nativeResponse{
+		columns: []nativeColumn{{"result", "UInt8"}},
+		rows:    [][]interface{}{{uint8(0)}},
+	}
+}
+
+// Unused but kept for binary import compatibility
+var _ = binary.LittleEndian
