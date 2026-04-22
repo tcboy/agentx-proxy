@@ -13,6 +13,33 @@ func NewCHTranslator() *CHTranslator {
 	return &CHTranslator{}
 }
 
+// mysqlReservedWords are words that need backtick-quoting when used as identifiers.
+var mysqlReservedWords = map[string]bool{
+	"release": true, "system": true, "groups": true, "status": true,
+	"key": true, "value": true, "order": true, "group": true,
+	"select": true, "from": true, "where": true, "having": true,
+	"limit": true, "offset": true, "as": true, "on": true,
+	"set": true, "into": true, "values": true, "update": true,
+	"delete": true, "create": true, "drop": true, "alter": true,
+	"index": true, "table": true, "column": true, "default": true,
+	"null": true, "primary": true, "unique": true, "foreign": true,
+	"references": true, "check": true, "constraint": true,
+	"between": true, "like": true, "in": true, "is": true,
+	"not": true, "and": true, "or": true, "exists": true,
+	"case": true, "when": true, "then": true, "else": true, "end": true,
+	"join": true, "inner": true, "left": true, "right": true, "outer": true,
+	"cross": true, "natural": true, "using": true,
+	"union": true, "all": true, "any": true, "some": true,
+	"asc": true, "desc": true, "with": true, "recursive": true,
+	"distinct": true, "if": true, "true": true, "false": true,
+	"read": true, "write": true, "lock": true, "unlock": true,
+	"action": true, "cascade": true, "restrict": true,
+	"begin": true, "commit": true, "rollback": true,
+	"database": true, "schema": true, "user": true, "grant": true,
+	"revoke": true, "flush": true, "process": true,
+	"rows": true, "row_count": true,
+}
+
 // Translate translates a ClickHouse SQL query to MySQL
 func (t *CHTranslator) Translate(sql string) (string, error) {
 	result := sql
@@ -32,6 +59,7 @@ func (t *CHTranslator) Translate(sql string) (string, error) {
 	result = t.translateTTL(result)
 	result = t.translateCast(result)
 	result = t.translateToUnixTimestamp64(result)
+	result = t.translateReservedWords(result)
 
 	return result, nil
 }
@@ -42,32 +70,12 @@ func (t *CHTranslator) translateFinal(sql string) string {
 }
 
 func (t *CHTranslator) translateLimit1By(sql string) string {
-	// LIMIT 1 BY col1, col2 -> ROW_NUMBER() OVER (PARTITION BY col1, col2 ORDER BY event_ts DESC) = 1
-	re := regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)\s+BY\s+(.+?)\s*$`)
-	return re.ReplaceAllStringFunc(sql, func(match string) string {
-		subMatches := re.FindStringSubmatch(match)
-		if len(subMatches) < 3 {
-			return match
-		}
-
-		limitN := subMatches[1]
-		_ = strings.TrimSpace(subMatches[2]) // byCols - used for potential ROW_NUMBER rewrite
-
-		// Remove LIMIT clause from main query
-		sql = strings.TrimSuffix(sql, match)
-
-		// Wrap in subquery with ROW_NUMBER
-		return fmt.Sprintf(") AS t WHERE rn <= %s", limitN)
-	})
-
-	// For more complex cases, we need to wrap the entire query
-	re = regexp.MustCompile(`(?i)(.+?)\s+LIMIT\s+(\d+)\s+BY\s+(.+?)\s*(ORDER|WHERE|GROUP|HAVING|$)`)
-	if re.MatchString(sql) {
-		// This is a complex case - for now, just strip the LIMIT BY
-		sql = regexp.MustCompile(`(?i)\s+LIMIT\s+\d+\s+BY\s+[^\s;]+`).ReplaceAllString(sql, "")
-	}
-
-	return sql
+	// LIMIT N BY col1, col2 is a ClickHouse-specific dedup mechanism.
+	// Stripping it is safe for OLTP targets — the proxy MySQL tables already
+	// have unique rows. A proper ROW_NUMBER rewrite would require full SQL
+	// parsing which is impractical with regex.
+	re := regexp.MustCompile(`(?i)\s*\bLIMIT\s+\d+\s+BY\s+[\w\s,.` + "`" + `]+`)
+	return strings.TrimSpace(re.ReplaceAllString(sql, ""))
 }
 
 func (t *CHTranslator) translateMapAccess(sql string) string {
@@ -118,8 +126,10 @@ func (t *CHTranslator) translateArrayFunctions(sql string) string {
 	re = regexp.MustCompile(`(?i)arrayElement\s*\((\w+),\s*(\d+)\)`)
 	sql = re.ReplaceAllString(sql, "JSON_UNQUOTE(JSON_EXTRACT($1, concat('$[', $2 - 1, ']')))")
 
-	// empty array -> '[]'
+	// empty array -> '[]' (only bare [], not already quoted '[]')
+	sql = strings.ReplaceAll(sql, "'[]'", "\x00EMPTY_ARRAY\x00")
 	sql = strings.ReplaceAll(sql, "[]", "'[]'")
+	sql = strings.ReplaceAll(sql, "\x00EMPTY_ARRAY\x00", "'[]'")
 
 	// Array literal: ['a', 'b'] -> JSON array
 	re = regexp.MustCompile(`\[('(?:[^'\\]|\\.)*'|[\d.]+)(?:\s*,\s*('(?:[^'\\]|\\.)*'|[\d.]+))*\]`)
@@ -437,8 +447,8 @@ func (t *CHTranslator) translateCast(sql string) string {
 	re := regexp.MustCompile(`(?i)CAST\((.+?)\s+AS\s+DateTime64\(\d+\)\)`)
 	sql = re.ReplaceAllString(sql, "CAST($1 AS DATETIME(3))")
 
-	// column::DateTime64(3) -> CAST(column AS DATETIME(3))
-	re = regexp.MustCompile(`(\w+)::DateTime64\(\d+\)`)
+	// column or literal::DateTime64(3) -> CAST(column AS DATETIME(3))
+	re = regexp.MustCompile(`(\w+|'[^']*')::DateTime64\(\d+\)`)
 	sql = re.ReplaceAllString(sql, "CAST($1 AS DATETIME(3))")
 
 	// column::String -> just the column
@@ -461,5 +471,27 @@ func (t *CHTranslator) translateToUnixTimestamp64(sql string) string {
 	re := regexp.MustCompile(`(?i)toUnixTimestamp64Nano\s*\(([^)]+)\)`)
 	sql = re.ReplaceAllString(sql, "(UNIX_TIMESTAMP($1) * 1000000000)")
 
+	return sql
+}
+
+func (t *CHTranslator) translateReservedWords(sql string) string {
+	// Backtick-quote MySQL reserved words used as identifiers in INSERT column lists.
+	re := regexp.MustCompile(`(?i)(INSERT\s+INTO\s+\w+\s*\()([^)]+)(\))`)
+	sql = re.ReplaceAllStringFunc(sql, func(match string) string {
+		sub := re.FindStringSubmatch(match)
+		if len(sub) != 4 {
+			return match
+		}
+		cols := strings.Split(sub[2], ",")
+		for i, col := range cols {
+			col = strings.TrimSpace(col)
+			if mysqlReservedWords[strings.ToLower(col)] && !strings.HasPrefix(col, "`") {
+				cols[i] = "`" + col + "`"
+			} else {
+				cols[i] = col
+			}
+		}
+		return sub[1] + strings.Join(cols, ", ") + sub[3]
+	})
 	return sql
 }

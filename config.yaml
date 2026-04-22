@@ -1,16 +1,16 @@
 # AgentX Proxy Configuration
 
 listen:
-  postgresql: "0.0.0.0:5432"
-  clickhouse_native: "0.0.0.0:9000"
-  clickhouse_http: "0.0.0.0:8123"
+  postgresql: "0.0.0.0:15432"
+  clickhouse_native: "0.0.0.0:19000"
+  clickhouse_http: "0.0.0.0:18123"
 
 mysql:
   host: "127.0.0.1"
   port: 3306
   user: "langfuse"
-  password: "langfuse"
-  database: "langfuse"
+  password: "langfusepassword"
+  database: "langfuse_test"
   max_open_conns: 100
   max_idle_conns: 20
   conn_max_lifetime: "10m"
@@ -28,5 +28,5 @@ proxy:
     write_flush_interval: "1s"
 
 log:
-  level: "info"
+  level: "debug"
   format: "json"

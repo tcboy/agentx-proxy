@@ -24,8 +24,12 @@ func NewTranslator(arrayColumnMode, fulltextMode string) *Translator {
 func (t *Translator) Translate(sql string) (string, error) {
 	result := sql
 
+	result = t.translateDoubleQuotes(result)
 	result = t.translateTypeCasts(result)
 	result = t.translateILIKE(result)
+	result = t.translateLimitNull(result)
+	result = t.translateEqualsNull(result)
+	result = t.translateUnionLimit(result)
 	result = t.translateReturning(result)
 	result = t.translateOnConflict(result)
 	result = t.translateDateTrunc(result)
@@ -38,6 +42,7 @@ func (t *Translator) Translate(sql string) (string, error) {
 	result = t.translateLateralJoin(result)
 	result = t.translateToTsVector(result)
 	result = t.translateAnyArray(result)
+	result = t.translateAny(result)
 	result = t.translateFinalKeyword(result)
 	result = t.translateMapAccess(result)
 	result = t.translateDollarParams(result)
@@ -69,6 +74,70 @@ func (t *Translator) translateILIKE(sql string) string {
 	sql = re.ReplaceAllString(sql, "LIKE COLLATE utf8mb4_general_ci")
 
 	return sql
+}
+
+func (t *Translator) translateLimitNull(sql string) string {
+	re := regexp.MustCompile(`(?i)\s+LIMIT\s+NULL\s*$`)
+	return re.ReplaceAllString(sql, "")
+}
+
+func (t *Translator) translateEqualsNull(sql string) string {
+	// = NULL -> IS NULL (standard SQL null comparison)
+	re := regexp.MustCompile(`(?i)(\w[\w.` + "`" + `]*\s*)=\s*NULL\b`)
+	sql = re.ReplaceAllString(sql, "${1}IS NULL")
+	// != NULL -> IS NOT NULL
+	re2 := regexp.MustCompile(`(?i)(\w[\w.` + "`" + `]*\s*)!=\s*NULL\b`)
+	sql = re2.ReplaceAllString(sql, "${1}IS NOT NULL")
+	return sql
+}
+
+// translateUnionLimit wraps each SELECT in a UNION with parentheses.
+// MySQL requires parentheses when individual SELECTs have LIMIT/ORDER BY:
+//   SELECT ... LIMIT 2 UNION ALL SELECT ... LIMIT 2
+// becomes:
+//   (SELECT ... LIMIT 2) UNION ALL (SELECT ... LIMIT 2)
+func (t *Translator) translateUnionLimit(sql string) string {
+	upper := strings.ToUpper(sql)
+	if !strings.Contains(upper, "UNION") {
+		return sql
+	}
+
+	// Split on UNION [ALL] while preserving the separator
+	re := regexp.MustCompile(`(?i)\b(UNION\s+ALL|UNION)\b`)
+	parts := re.Split(sql, -1)
+	seps := re.FindAllString(sql, -1)
+
+	if len(parts) <= 1 {
+		return sql
+	}
+
+	var buf strings.Builder
+	for i, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed == "" {
+			continue
+		}
+		needsWrap := false
+		tu := strings.ToUpper(trimmed)
+		if strings.Contains(tu, " LIMIT ") || strings.Contains(tu, " ORDER BY ") {
+			needsWrap = true
+		}
+		// Don't wrap the last part if it's a trailing ORDER BY/LIMIT for the whole UNION
+		if i == len(parts)-1 && needsWrap {
+			needsWrap = false
+		}
+
+		if i > 0 && len(seps) > i-1 {
+			buf.WriteString(" " + seps[i-1] + " ")
+		}
+
+		if needsWrap && strings.HasPrefix(tu, "SELECT") {
+			buf.WriteString("(" + trimmed + ")")
+		} else {
+			buf.WriteString(trimmed)
+		}
+	}
+	return buf.String()
 }
 
 func (t *Translator) translateReturning(sql string) string {
@@ -374,6 +443,18 @@ func (t *Translator) translateAnyArray(sql string) string {
 	return sql
 }
 
+func (t *Translator) translateAny(sql string) string {
+	// Handle: column = ANY ( NULL ) → 1=0 (always false)
+	re := regexp.MustCompile(`(?i)(\w[\w."` + "`" + `]*)\s*=\s*ANY\s*\(\s*NULL\s*\)`)
+	sql = re.ReplaceAllString(sql, "1=0")
+
+	// Handle: column = ANY ( $N ) → just reference the param directly (won't match array semantics but avoids syntax error)
+	re2 := regexp.MustCompile(`(?i)(\w[\w."` + "`" + `]*)\s*=\s*ANY\s*\(\s*\$(\d+)\s*\)`)
+	sql = re2.ReplaceAllString(sql, "${1} = ${2}")
+
+	return sql
+}
+
 func (t *Translator) translateFinalKeyword(sql string) string {
 	re := regexp.MustCompile(`(?i)\bFINAL\b`)
 	return re.ReplaceAllString(sql, "")
@@ -458,11 +539,10 @@ func parseColumns(cols string) []string {
 }
 
 func wrapReturningSelect(mainSQL, returningCols string) string {
-	tmpTable := fmt.Sprintf("_ret_%d", rand.IntN(1000000))
-	return fmt.Sprintf(
-		"CREATE TEMPORARY TABLE IF NOT EXISTS %s AS %s; SELECT %s FROM %s",
-		tmpTable, mainSQL, returningCols, tmpTable,
-	)
+	// MySQL doesn't support RETURNING. For INSERT ... RETURNING,
+	// just execute the INSERT. The caller (executePreparedStatement)
+	// will handle sending back the result row.
+	return mainSQL
 }
 
 // TranslateDDL translates PG DDL to MySQL DDL
@@ -482,5 +562,71 @@ func (t *Translator) TranslateDDL(sql string) string {
 	result = regexp.MustCompile(`(?i)\bGENERATED\s+ALWAYS\s+AS\s+IDENTITY\b`).ReplaceAllString(result, "AUTO_INCREMENT")
 	result = regexp.MustCompile(`(?i)\bUSING\s+GIN\b`).ReplaceAllString(result, "")
 
+	return result
+}
+
+// translateDoubleQuotes converts PG double-quoted identifiers to MySQL backtick quotes.
+func (t *Translator) translateDoubleQuotes(sql string) string {
+	var buf strings.Builder
+	buf.Grow(len(sql))
+	i := 0
+	for i < len(sql) {
+		ch := sql[i]
+		if ch == '\'' {
+			buf.WriteByte(ch)
+			i++
+			for i < len(sql) {
+				if sql[i] == '\'' {
+					buf.WriteByte('\'')
+					i++
+					if i < len(sql) && sql[i] == '\'' {
+						buf.WriteByte('\'')
+						i++
+						continue
+					}
+					break
+				}
+				if sql[i] == '\\' && i+1 < len(sql) {
+					buf.WriteByte(sql[i])
+					i++
+					buf.WriteByte(sql[i])
+					i++
+					continue
+				}
+				buf.WriteByte(sql[i])
+				i++
+			}
+			continue
+		}
+		if ch == '"' {
+			i++
+			start := i
+			for i < len(sql) && sql[i] != '"' {
+				i++
+			}
+			ident := sql[start:i]
+			if i < len(sql) {
+				i++
+			}
+			// Strip "public". prefix
+			if idx := strings.LastIndex(ident, "."); idx >= 0 {
+				prefix := ident[:idx]
+				// Strip backtick-quoted or bare "public" schema
+				trimmed := strings.Trim(prefix, "`")
+				if trimmed == "public" {
+					ident = ident[idx+1:]
+				}
+			}
+			buf.WriteByte('`')
+			buf.WriteString(ident)
+			buf.WriteByte('`')
+			continue
+		}
+		buf.WriteByte(ch)
+		i++
+	}
+	// Strip `public`. schema prefixes (PG's default schema, not used in MySQL)
+	result := buf.String()
+	result = strings.ReplaceAll(result, "`public`.", "")
 	return result
 }

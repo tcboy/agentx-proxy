@@ -164,6 +164,8 @@ func (s *HTTPServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		for i, v := range values {
 			if v == nil {
 				strValues[i] = "\\N"
+			} else if b, ok := v.([]byte); ok {
+				strValues[i] = string(b)
 			} else {
 				strValues[i] = fmt.Sprintf("%v", v)
 			}
@@ -302,7 +304,7 @@ func (s *HTTPServer) getSystemColumns() string {
 
 func (s *HTTPServer) existsTable(query string) string {
 	parts := strings.Fields(query)
-	if len(parts) >= 4 {
+	if len(parts) >= 3 {
 		tableName := parts[len(parts)-1]
 		tableName = strings.Trim(tableName, "`")
 
@@ -893,7 +895,7 @@ func (s *NativeServer) getNativeSystemColumns() *nativeResponse {
 
 func (s *NativeServer) nativeExistsTable(query string) *nativeResponse {
 	parts := strings.Fields(query)
-	if len(parts) >= 4 {
+	if len(parts) >= 3 {
 		tableName := strings.Trim(parts[len(parts)-1], "`")
 		ctx := context.Background()
 		exists, err := s.pool.TableExists(ctx, tableName)

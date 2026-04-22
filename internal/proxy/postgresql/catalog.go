@@ -11,11 +11,17 @@ import (
 
 // Catalog handles pg_catalog system table emulation
 type Catalog struct {
-	pool *mysql.Pool
+	pool         *mysql.Pool
+	colTypeCache map[colKey]uint32
+}
+
+type colKey struct {
+	table string
+	col   string
 }
 
 func NewCatalog(pool *mysql.Pool) *Catalog {
-	return &Catalog{pool: pool}
+	return &Catalog{pool: pool, colTypeCache: make(map[colKey]uint32)}
 }
 
 // IsCatalogQuery checks if a query is targeting pg_catalog
@@ -200,6 +206,30 @@ func (c *Catalog) handlePGType(ctx context.Context, sql string) ([]string, [][]i
 				return columns, filtered, nil
 			}
 		}
+
+		// Try typname IN (...) condition
+		nameInRe := regexp.MustCompile(`(?i)typname\s+IN\s*\(([^)]+)\)`)
+		if m := nameInRe.FindStringSubmatch(sql); len(m) > 1 {
+			nameStrs := strings.Split(m[1], ",")
+			names := make(map[string]bool)
+			for _, s := range nameStrs {
+				s = strings.TrimSpace(s)
+				s = strings.Trim(s, "'")
+				names[s] = true
+			}
+			var filtered [][]interface{}
+			for _, t := range types {
+				if names[t[1].(string)] {
+					filtered = append(filtered, t)
+				}
+			}
+			if len(filtered) > 0 {
+				return columns, filtered, nil
+			}
+		}
+
+		// WHERE clause present but no filter matched — return empty
+		return columns, nil, nil
 	}
 
 	return columns, types, nil
@@ -641,4 +671,60 @@ func (c *Catalog) handlePGExtension(ctx context.Context, query string) ([]string
 	}
 
 	return columns, extensions, nil
+}
+
+// GetColumnPGOID returns the PostgreSQL OID for a column in a MySQL table.
+// Used to infer parameter types for INSERT queries.
+func (c *Catalog) GetColumnPGOID(tableName, colName string) uint32 {
+	key := colKey{table: strings.ToLower(tableName), col: strings.ToLower(colName)}
+	if oid, ok := c.colTypeCache[key]; ok {
+		return oid
+	}
+
+	ctx := context.Background()
+	var dataType string
+	err := c.pool.QueryRow(ctx,
+		"SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+		tableName, colName,
+	).Scan(&dataType)
+	if err != nil {
+		return 0
+	}
+
+	oid := mysqlDataTypeToPGOID(dataType)
+	c.colTypeCache[key] = oid
+	return oid
+}
+
+func mysqlDataTypeToPGOID(dt string) uint32 {
+	switch strings.ToUpper(dt) {
+	case "TINYINT":
+		return 21 // int2
+	case "SMALLINT":
+		return 21 // int2
+	case "INT", "INTEGER", "MEDIUMINT":
+		return 23 // int4
+	case "BIGINT":
+		return 20 // int8
+	case "FLOAT":
+		return 700 // float4
+	case "DOUBLE":
+		return 701 // float8
+	case "DECIMAL", "NUMERIC":
+		return 25 // text
+	case "DATE":
+		return 1082 // date
+	case "TIME":
+		return 1083 // time
+	case "DATETIME", "TIMESTAMP":
+		return 25 // text
+	case "VARCHAR", "CHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT":
+		return 25 // text
+	case "JSON":
+		return 1009 // text[] — Prisma stores String[] as MySQL JSON
+	case "BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "BINARY", "VARBINARY":
+		return 17 // bytea
+	default:
+		return 25 // text
+	}
 }

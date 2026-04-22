@@ -16,7 +16,7 @@ type Pool struct {
 }
 
 func NewPool(cfg *config.MySQLConfig) (*Pool, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&loc=UTC&multiStatements=true&allowNativePasswords=true",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&loc=UTC&multiStatements=true&allowNativePasswords=true&sql_mode=ANSI_QUOTES",
 		cfg.User,
 		cfg.Password,
 		cfg.Host,

@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
+	"time"
 )
 
 // Writer writes PG wire protocol messages
@@ -87,8 +89,14 @@ func (w *Writer) SendRowDescription(fields []FieldDescription) error {
 	return w.writeMessage(MsgRowDescription, buf.Bytes())
 }
 
-// SendDataRow sends a single row of data
-func (w *Writer) SendDataRow(values []interface{}, formatCodes []int16) error {
+// SendDataRow sends a single row of data.
+// formatCodes is per-column format (0=text, 1=binary).
+// typeOIDs is used for binary encoding when format is 1.
+func (w *Writer) SendDataRow(values []interface{}, formatCodes []int16, typeOIDs ...[]uint32) error {
+	var oids []uint32
+	if len(typeOIDs) > 0 {
+		oids = typeOIDs[0]
+	}
 	buf := bytes.NewBuffer(nil)
 	binary.Write(buf, binary.BigEndian, uint16(len(values)))
 	for i, v := range values {
@@ -125,15 +133,90 @@ func (w *Writer) SendDataRow(values []interface{}, formatCodes []int16) error {
 			data = []byte(fmt.Sprintf("%v", val))
 		}
 
-		if fmtCode == 1 { // binary format
-			binary.Write(buf, binary.BigEndian, int32(len(data)))
-			buf.Write(data)
-		} else {
-			binary.Write(buf, binary.BigEndian, int32(len(data)))
-			buf.Write(data)
+		if fmtCode == 1 {
+			// Binary format: encode text values to binary based on OID
+			var oid uint32
+			if i < len(oids) {
+				oid = oids[i]
+			}
+			data = textToBinary(data, oid)
 		}
+
+		binary.Write(buf, binary.BigEndian, int32(len(data)))
+		buf.Write(data)
 	}
 	return w.writeMessage(MsgDataRow, buf.Bytes())
+}
+
+// textToBinary converts a text representation of a value to its binary form
+// based on the PostgreSQL type OID.
+func textToBinary(text []byte, oid uint32) []byte {
+	s := string(text)
+	switch oid {
+	case 16: // bool
+		if s == "t" || s == "true" || s == "1" {
+			return []byte{1}
+		}
+		return []byte{0}
+	case 21: // int2
+		n, _ := strconv.ParseInt(s, 10, 16)
+		buf := make([]byte, 2)
+		binary.BigEndian.PutUint16(buf, uint16(n))
+		return buf
+	case 23: // int4
+		n, _ := strconv.ParseInt(s, 10, 32)
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, uint32(n))
+		return buf
+	case 20: // int8
+		n, _ := strconv.ParseInt(s, 10, 64)
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(n))
+		return buf
+	case 700: // float4
+		f, _ := strconv.ParseFloat(s, 32)
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, math.Float32bits(float32(f)))
+		return buf
+	case 701: // float8
+		f, _ := strconv.ParseFloat(s, 64)
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, math.Float64bits(f))
+		return buf
+	case 1114: // timestamp
+		// Binary timestamp: microseconds since 2000-01-01
+		return textToBinaryTimestamp(s)
+	default:
+		// Text types and unknown: return as-is
+		return text
+	}
+}
+
+func textToBinaryTimestamp(s string) []byte {
+	// Try common formats
+	formats := []string{
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+		time.RFC3339Nano,
+		time.RFC3339,
+	}
+	var t time.Time
+	var err error
+	for _, f := range formats {
+		t, err = time.Parse(f, s)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return []byte(s)
+	}
+	// PostgreSQL epoch: 2000-01-01 00:00:00 UTC
+	pgEpoch := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	micros := t.Sub(pgEpoch).Microseconds()
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(micros))
+	return buf
 }
 
 // SendCommandComplete sends the completion message for a command
